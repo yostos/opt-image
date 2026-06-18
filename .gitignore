@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / tooling
+*.swp
+*~
+.idea/
+.vscode/
+
+# opt-image が生成するバックアップ（テスト実行時に発生しうる）
+*.bak
+
+# テスト作業ディレクトリ（fixtures をコピーして処理する一時領域）
+/tmp-test/
+*.tmp

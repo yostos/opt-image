@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+#
+# opt-image - resize, optionally reduce colors / add a signature, and re-encode
+# an image into an optimized format. See docs/USAGE.md for details and
+# test/opt-image.bats for the tests.
+#
+# Pipelines:
+#   -f jpg  : magick(resize/sign)          -> cjpeg (mozjpeg)   lossy
+#   -f webp : magick(resize/sign/-colors)  -> cwebp -lossless   lossless
+#   -f png  : magick(resize/sign/-colors)  -> oxipng            lossless
+#
+# Edit the "USER SETTINGS" block below to change the signature, etc. (each value
+# can also be overridden via env: OPT_IMAGE_SIG1 / OPT_IMAGE_SIG2 /
+# OPT_IMAGE_FONT / OPT_IMAGE_JPEG_QUALITY / OPT_IMAGE_PIXELS). Tool paths can be
+# overridden with MAGICK / CJPEG / CWEBP / OXIPNG.
+
+PROG="$(basename "$0")"
+
+# ============================================================================
+# USER SETTINGS (edit here; each value can also be overridden via env)
+# ----------------------------------------------------------------------------
+# Signature text: the two lines drawn at the bottom-right when -s is given.
+#   -> Change these to your own name / year / license. Setting the env vars
+#      OPT_IMAGE_SIG1 / OPT_IMAGE_SIG2 overrides them without editing the source.
+SIG_LINE1="${OPT_IMAGE_SIG1:-© 2026 Toshiyuki Yoshida}"
+SIG_LINE2="${OPT_IMAGE_SIG2:-CC BY-NC-SA 4.0}"
+
+# Signature font. ImageMagick here has no default font configured, so an
+# explicit path is required.
+SIG_FONT="${OPT_IMAGE_FONT:-/System/Library/Fonts/Supplemental/Arial.ttf}"
+
+# JPEG quality (cjpeg -quality) and the default resize long edge.
+JPEG_QUALITY="${OPT_IMAGE_JPEG_QUALITY:-85}"
+DEFAULT_PIXELS="${OPT_IMAGE_PIXELS:-1800}"
+# ============================================================================
+
+show_help() {
+  cat <<EOF
+Usage: $PROG [options] <input-image>
+
+Options:
+  -f <jpg|webp|png>       Output format (default: jpg)
+                          jpg=lossy / webp,png=lossless
+  -c <2|16|125|256|4096>  Reduce colors (webp/png only)
+  -p <pixels>             Resize long edge to <pixels> (default: ${DEFAULT_PIXELS})
+  -n                      Do not resize
+  -s <white|dark>         Add signature text (white / dark)
+  -h                      Show this help
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+# ---- Parse options ---------------------------------------------------------
+
+format="jpg"
+colors=""
+pixels="$DEFAULT_PIXELS"
+resize=true
+signature=false
+sigcolor=""
+
+while getopts ":f:c:p:s:nh" opt; do
+  case "$opt" in
+    f) format="$OPTARG" ;;
+    c) colors="$OPTARG" ;;
+    p) pixels="$OPTARG" ;;
+    n) resize=false ;;
+    s) signature=true; sigcolor="$OPTARG" ;;
+    h) show_help; exit 0 ;;
+    :) die "option -$OPTARG requires an argument" ;;
+    \?) echo "Error: invalid option -$OPTARG" >&2; show_help >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# ---- Validation (do everything before touching the input) ------------------
+
+case "$format" in
+  jpg|webp|png) ;;
+  *) die "invalid format '$format' (allowed: jpg, webp, png)" ;;
+esac
+
+sig_fill=""
+if $signature; then
+  case "$sigcolor" in
+    white) sig_fill="white" ;;
+    dark)  sig_fill="gray50" ;;
+    *) die "invalid signature color '$sigcolor' (allowed: white, dark)" ;;
+  esac
+fi
+
+if [ -n "$colors" ]; then
+  [ "$format" = "jpg" ] && die "-c is not valid for jpg (lossy format does not use color reduction)"
+  case "$colors" in
+    2|16|125|256|4096) ;;
+    *) die "invalid color count '$colors' (allowed: 2, 16, 125, 256, 4096)" ;;
+  esac
+fi
+
+if $resize; then
+  case "$pixels" in
+    ''|*[!0-9]*) die "invalid pixels '$pixels' (must be a positive integer)" ;;
+  esac
+fi
+
+if [ "$#" -ne 1 ]; then
+  show_help >&2
+  die "exactly one input file is required"
+fi
+input="$1"
+[ -f "$input" ] || die "file '$input' not found"
+
+# ---- Resolve external tools (only the ones the format needs) ---------------
+
+MAGICK="${MAGICK:-magick}"
+command -v "$MAGICK" >/dev/null 2>&1 \
+  || die "magick (ImageMagick) not found. Install: brew install imagemagick"
+
+case "$format" in
+  jpg)
+    if [ -z "${CJPEG:-}" ]; then
+      if [ -x /opt/homebrew/opt/mozjpeg/bin/cjpeg ]; then
+        CJPEG="/opt/homebrew/opt/mozjpeg/bin/cjpeg"
+      else
+        CJPEG="cjpeg"
+      fi
+    fi
+    command -v "$CJPEG" >/dev/null 2>&1 \
+      || die "cjpeg (mozjpeg) not found. Install: brew install mozjpeg"
+    ;;
+  webp)
+    CWEBP="${CWEBP:-cwebp}"
+    command -v "$CWEBP" >/dev/null 2>&1 \
+      || die "cwebp not found. Install: brew install webp"
+    ;;
+  png)
+    OXIPNG="${OXIPNG:-oxipng}"
+    command -v "$OXIPNG" >/dev/null 2>&1 \
+      || die "oxipng not found. Install: brew install oxipng"
+    ;;
+esac
+
+# ---- Output path and backup ------------------------------------------------
+
+output="${input%.*}.${format}"
+backup="${input}.bak"
+
+cp "$input" "$backup" || die "failed to create backup '$backup'"
+
+tmp="$(mktemp -d)" || die "failed to create temp directory"
+trap 'rm -rf "$tmp"' EXIT
+
+# ---- Build the magick operation list (array; no eval) ----------------------
+# Order: resize -> signature -> color reduction (-colors last so the signature
+# is included in the quantization).
+
+# Normalize to 8-bit (jpg/webp/png are all 8-bit in this tool). Without this a
+# 16-bit input breaks webp's "lossless" path on the 16->8 bit conversion.
+ops=( -depth 8 )
+# Trailing '>' means "only shrink if larger than the target" (never upscale).
+$resize && ops+=( -resize "${pixels}x${pixels}>" )
+if $signature; then
+  [ -f "$SIG_FONT" ] || die "signature font not found: $SIG_FONT (set OPT_IMAGE_FONT)"
+  ops+=( -font "$SIG_FONT" -gravity southeast -fill "$sig_fill"
+         -pointsize 20 -annotate +80+30 "$SIG_LINE1"
+         -pointsize 16 -annotate +80+10 "$SIG_LINE2" )
+fi
+[ -n "$colors" ] && ops+=( -colors "$colors" )
+
+# ---- Per-format processing -------------------------------------------------
+
+case "$format" in
+  jpg)
+    "$MAGICK" "$input" "${ops[@]}" "$tmp/im.ppm" \
+      || die "image processing (magick) failed"
+    "$CJPEG" -quality "$JPEG_QUALITY" -optimize -progressive \
+      -outfile "$tmp/out.jpg" "$tmp/im.ppm" \
+      || die "jpeg encoding (cjpeg) failed"
+    result="$tmp/out.jpg"
+    ;;
+  webp)
+    "$MAGICK" "$input" "${ops[@]}" "$tmp/im.png" \
+      || die "image processing (magick) failed"
+    "$CWEBP" -lossless -exact -quiet "$tmp/im.png" -o "$tmp/out.webp" \
+      || die "webp encoding (cwebp) failed"
+    result="$tmp/out.webp"
+    ;;
+  png)
+    "$MAGICK" "$input" "${ops[@]}" "$tmp/out.png" \
+      || die "image processing (magick) failed"
+    "$OXIPNG" -o max -q "$tmp/out.png" \
+      || die "png optimization (oxipng) failed"
+    result="$tmp/out.png"
+    ;;
+esac
+
+# ---- Commit (replace the original only on success) -------------------------
+
+[ "$output" != "$input" ] && rm -f "$input"
+mv "$result" "$output" || die "failed to write output '$output'"
+
+echo "Done: $output  (backup: $backup)"
